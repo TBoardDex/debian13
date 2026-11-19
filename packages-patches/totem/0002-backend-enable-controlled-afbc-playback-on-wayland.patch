@@ -1,0 +1,278 @@
+From 22c12064f588ef6b5c35a05479a3e04a93015ba4 Mon Sep 17 00:00:00 2001
+From: Weiye Chen <weiye.chen@rock-chips.com>
+Date: Sat, 12 Sep 2026 15:17:32 +0800
+Subject: [PATCH 2/2] backend: enable controlled AFBC playback on Wayland
+
+Enable Rockchip MPP FBC when
+GST_MPP_VIDEODEC_DEFAULT_ARM_AFBC is set to 1 and gtkwaylandsink is
+selected. Keep the existing linear playback path otherwise.
+
+If gtkwaylandsink reports an AFBC import failure, rebuild the pipeline
+once with linear buffers and restore the playback state and position.
+---
+ src/backend/bacon-video-widget.c | 212 ++++++++++++++++++++++++++++---
+ 1 file changed, 196 insertions(+), 16 deletions(-)
+
+diff --git a/src/backend/bacon-video-widget.c b/src/backend/bacon-video-widget.c
+index 5c05c2c..a381aba 100644
+--- a/src/backend/bacon-video-widget.c
++++ b/src/backend/bacon-video-widget.c
+@@ -108,2 +108,6 @@
+
++#define BVW_AFBC_PLAY_FLAGS_MASK \
++  (GST_PLAY_FLAG_NATIVE_VIDEO | GST_PLAY_FLAG_SOFT_COLORBALANCE | \
++   GST_PLAY_FLAG_DEINTERLACE)
++
+ #define is_error(e, d, c) \
+@@ -164,2 +168,8 @@ static const gchar *video_props_str[4] = {
+
++typedef enum {
++  BVW_AFBC_RECOVERY_NONE,
++  BVW_AFBC_RECOVERY_PREROLL,
++  BVW_AFBC_RECOVERY_SEEK
++} BvwAfbcRecoveryState;
++
+ struct _BaconVideoWidget
+@@ -202,2 +212,7 @@ struct _BaconVideoWidget
+   gboolean                     use_gtkwaylandsink;
++  gboolean                     request_afbc;
++  gboolean                     afbc_fallback_attempted;
++  BvwAfbcRecoveryState         afbc_recovery_state;
++  gint64                       afbc_recovery_position;
++  GstState                     afbc_recovery_target_state;
+
+@@ -301,2 +316,4 @@ static gboolean bacon_video_widget_seek_time_no_lock (BaconVideoWidget *bvw,
+ 						      GError **error);
++static gboolean bvw_maybe_start_afbc_fallback (BaconVideoWidget *bvw,
++                                               GstMessage *message);
+ static gboolean update_subtitles_tracks (BaconVideoWidget *bvw);
+@@ -1862,2 +1879,103 @@ out:
+
++static void
++bvw_set_afbc_play_flags (BaconVideoWidget *bvw,
++                         gboolean enabled)
++{
++  GstPlayFlags flags;
++
++  g_object_get (bvw->play, "flags", &flags, NULL);
++  flags &= ~BVW_AFBC_PLAY_FLAGS_MASK;
++  if (enabled)
++    flags |= GST_PLAY_FLAG_NATIVE_VIDEO;
++  else
++    flags |= GST_PLAY_FLAG_SOFT_COLORBALANCE | GST_PLAY_FLAG_DEINTERLACE;
++  g_object_set (bvw->play, "flags", flags, NULL);
++}
++
++static void
++bvw_finish_afbc_fallback (BaconVideoWidget *bvw)
++{
++  GstState target_state = bvw->afbc_recovery_target_state;
++
++  bvw->afbc_recovery_state = BVW_AFBC_RECOVERY_NONE;
++  bvw->afbc_recovery_position = 0;
++  bvw->target_state = target_state;
++
++  GST_WARNING ("AFBC playback fallback completed; continuing with linear buffers");
++  if (target_state == GST_STATE_PLAYING)
++    bacon_video_widget_play (bvw, NULL);
++  else
++    gst_element_set_state (bvw->play, target_state);
++}
++
++static gboolean
++bvw_maybe_start_afbc_fallback (BaconVideoWidget *bvw,
++                               GstMessage *message)
++{
++  g_autoptr(GError) error = NULL;
++  g_autofree gchar *debug = NULL;
++  gint64 position = GST_CLOCK_TIME_NONE;
++  GstStateChangeReturn state_ret;
++
++  if (!bvw->request_afbc || !bvw->use_gtkwaylandsink ||
++      GST_MESSAGE_SRC (message) != GST_OBJECT (bvw->video_sink))
++    return FALSE;
++
++  gst_message_parse_error (message, &error, &debug);
++  if ((error == NULL || strstr (error->message, "totem-afbc-fallback:") == NULL) &&
++      (debug == NULL || strstr (debug, "totem-afbc-fallback:") == NULL))
++    return FALSE;
++
++  /* Ignore duplicate import failures while the one permitted recovery is
++   * already tearing down the AFBC pipeline. Any later failure is fatal. */
++  if (bvw->afbc_recovery_state != BVW_AFBC_RECOVERY_NONE)
++    return TRUE;
++  if (bvw->afbc_fallback_attempted)
++    return FALSE;
++
++  bvw->afbc_fallback_attempted = TRUE;
++  bvw->afbc_recovery_state = BVW_AFBC_RECOVERY_PREROLL;
++  bvw->afbc_recovery_target_state = bvw->target_state;
++  if (!gst_element_query_position (bvw->play, GST_FORMAT_TIME, &position) ||
++      !GST_CLOCK_TIME_IS_VALID (position))
++    position = MAX (bvw->current_time, 0) * GST_MSECOND;
++  bvw->afbc_recovery_position = position / GST_MSECOND;
++
++  g_mutex_lock (&bvw->seek_mutex);
++  bvw->seek_req_time = GST_CLOCK_TIME_NONE;
++  bvw->seek_time = -1;
++  g_mutex_unlock (&bvw->seek_mutex);
++
++  GST_WARNING ("AFBC import failed at %" GST_TIME_FORMAT
++      "; rebuilding once with linear buffers",
++      GST_TIME_ARGS (position));
++
++  /* The failed AFBC pipeline may already have a visible DMA-BUF. Keep the
++   * transparent top-level window covered before tearing it down. */
++  g_signal_emit (bvw, bvw_signals[SIGNAL_VIDEO_TRANSITION_START], 0);
++  bvw_set_afbc_play_flags (bvw, FALSE);
++  gst_bus_set_flushing (bvw->bus, TRUE);
++  state_ret = gst_element_set_state (bvw->play, GST_STATE_NULL);
++  if (state_ret == GST_STATE_CHANGE_FAILURE)
++    goto state_change_failed;
++  state_ret = gst_element_set_state (bvw->play, GST_STATE_READY);
++  if (state_ret == GST_STATE_CHANGE_FAILURE)
++    goto state_change_failed;
++  gst_bus_set_flushing (bvw->bus, FALSE);
++
++  bvw->target_state = GST_STATE_PAUSED;
++  state_ret = gst_element_set_state (bvw->play, GST_STATE_PAUSED);
++  if (state_ret == GST_STATE_CHANGE_FAILURE)
++    goto state_change_failed_unflushed;
++  return TRUE;
++
++state_change_failed:
++  gst_bus_set_flushing (bvw->bus, FALSE);
++state_change_failed_unflushed:
++  GST_ERROR ("Could not rebuild the playback pipeline after AFBC failure");
++  bvw->afbc_recovery_state = BVW_AFBC_RECOVERY_NONE;
++  bvw->afbc_recovery_position = 0;
++  return FALSE;
++}
++
+ static void
+@@ -1882,2 +2000,5 @@ bvw_bus_message_cb (GstBus * bus, GstMessage * message, BaconVideoWidget *bvw)
+
++      if (bvw_maybe_start_afbc_fallback (bvw, message))
++        break;
++
+       if (!bvw_check_missing_plugins_error (bvw, message) &&
+@@ -2006,2 +2127,25 @@ bvw_bus_message_cb (GstBus * bus, GstMessage * message, BaconVideoWidget *bvw)
+ 	gint64 _time;
++
++	if (GST_MESSAGE_SRC (message) == GST_OBJECT (bvw->play) &&
++	    bvw->afbc_recovery_state != BVW_AFBC_RECOVERY_NONE) {
++	  if (bvw->afbc_recovery_state == BVW_AFBC_RECOVERY_PREROLL &&
++	      bvw->afbc_recovery_position > 0) {
++	    gint64 position = bvw->afbc_recovery_position;
++
++	    bvw->afbc_recovery_state = BVW_AFBC_RECOVERY_SEEK;
++	    GST_WARNING ("Restoring playback position to %" GST_TIME_FORMAT,
++	        GST_TIME_ARGS (position * GST_MSECOND));
++	    if (!bacon_video_widget_seek_time_no_lock (bvw, position, 0, NULL)) {
++	      GST_WARNING ("Could not restore position after AFBC fallback");
++	      bvw_finish_afbc_fallback (bvw);
++	    }
++	  } else {
++	    bvw_finish_afbc_fallback (bvw);
++	  }
++	  bvw_get_navigation_if_available (bvw);
++	  bacon_video_widget_get_stream_length (bvw);
++	  bacon_video_widget_is_seekable (bvw);
++	  break;
++	}
++
+ 	/* When a seek has finished, set the playing state again */
+@@ -2264,12 +2408,40 @@ playbin_element_setup_cb (GstElement *playbin,
+ {
++  GstElementFactory *factory;
++  GParamSpec *fbc_pspec;
++  const gchar *plugin_name;
++  gboolean enable_fbc;
++  gboolean actual_fbc = FALSE;
+   char *template;
+
+-  if (g_strcmp0 (G_OBJECT_TYPE_NAME (element), "GstDownloadBuffer") != 0)
+-    return;
++  factory = gst_element_get_factory (element);
++  plugin_name = factory != NULL ?
++      gst_plugin_feature_get_plugin_name (GST_PLUGIN_FEATURE (factory)) : NULL;
++  fbc_pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (element), "fbc");
++
++  if (g_strcmp0 (plugin_name, "rockchipmpp") == 0 &&
++      fbc_pspec != NULL &&
++      G_IS_PARAM_SPEC_BOOLEAN (fbc_pspec) &&
++      (fbc_pspec->flags & (G_PARAM_READABLE | G_PARAM_WRITABLE)) ==
++          (G_PARAM_READABLE | G_PARAM_WRITABLE)) {
++    enable_fbc = bvw->request_afbc && bvw->use_gtkwaylandsink &&
++        !bvw->afbc_fallback_attempted;
++    g_object_set (element, "fbc", enable_fbc, NULL);
++    g_object_get (element, "fbc", &actual_fbc, NULL);
++
++    if (actual_fbc != enable_fbc)
++      GST_WARNING_OBJECT (element,
++          "Failed to set Rockchip MPP FBC policy to %d", enable_fbc);
++    else
++      GST_INFO_OBJECT (element,
++          "Rockchip MPP FBC policy set to %d", actual_fbc);
++  }
+
+-  /* See also bacon_video_widget_init() */
+-  template = g_build_filename (g_get_user_cache_dir (), "totem", "stream-buffer", "XXXXXX", NULL);
+-  g_object_set (element, "temp-template", template, NULL);
+-  GST_DEBUG ("Reconfigured file download template to '%s'", template);
+-  g_free (template);
++  if (g_strcmp0 (G_OBJECT_TYPE_NAME (element), "GstDownloadBuffer") == 0) {
++    /* See also bacon_video_widget_init() */
++    template = g_build_filename (g_get_user_cache_dir (), "totem",
++        "stream-buffer", "XXXXXX", NULL);
++    g_object_set (element, "temp-template", template, NULL);
++    GST_DEBUG ("Reconfigured file download template to '%s'", template);
++    g_free (template);
++  }
+ }
+@@ -3618,2 +3790,8 @@ bacon_video_widget_open (BaconVideoWidget *bvw,
+   bvw->media_has_audio = FALSE;
++  bvw->afbc_fallback_attempted = FALSE;
++  bvw->afbc_recovery_state = BVW_AFBC_RECOVERY_NONE;
++  bvw->afbc_recovery_position = 0;
++  bvw->afbc_recovery_target_state = GST_STATE_PAUSED;
++  if (bvw->request_afbc && bvw->use_gtkwaylandsink)
++    bvw_set_afbc_play_flags (bvw, TRUE);
+
+@@ -3754,8 +3932,6 @@ bacon_video_widget_seek_time_no_lock (BaconVideoWidget *bvw,
+
+-  gst_element_seek (bvw->play, bvw->rate,
+-		    GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH | flag,
+-		    GST_SEEK_TYPE_SET, _time * GST_MSECOND,
+-		    GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+-
+-  return TRUE;
++  return gst_element_seek (bvw->play, bvw->rate,
++		           GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH | flag,
++		           GST_SEEK_TYPE_SET, _time * GST_MSECOND,
++		           GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+ }
+@@ -3811,5 +3987,3 @@ bacon_video_widget_seek_time (BaconVideoWidget *bvw, gint64 _time, gboolean accu
+   flag = (accurate ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_NONE);
+-  bacon_video_widget_seek_time_no_lock (bvw, _time, flag, error);
+-
+-  return TRUE;
++  return bacon_video_widget_seek_time_no_lock (bvw, _time, flag, error);
+ }
+@@ -3882,2 +4056,4 @@ bvw_stop_play_pipeline (BaconVideoWidget * bvw)
+     g_signal_emit (bvw, bvw_signals[SIGNAL_VIDEO_TRANSITION_START], 0);
++  bvw->afbc_recovery_state = BVW_AFBC_RECOVERY_NONE;
++  bvw->afbc_recovery_position = 0;
+
+@@ -5662,2 +5838,4 @@ bvw_init_video_sink (BaconVideoWidget *bvw)
+
++  bvw->request_afbc =
++    is_feature_enabled ("GST_MPP_VIDEODEC_DEFAULT_ARM_AFBC");
+   bvw->use_gtkwaylandsink =
+@@ -5716,2 +5894,4 @@ bvw_init_video_sink (BaconVideoWidget *bvw)
+   g_object_set (bvw->play, "flags", flags, NULL);
++  if (bvw->request_afbc && bvw->use_gtkwaylandsink)
++    bvw_set_afbc_play_flags (bvw, TRUE);
+
+--
+2.34.1

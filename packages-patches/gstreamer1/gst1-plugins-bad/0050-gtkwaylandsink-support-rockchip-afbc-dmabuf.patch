@@ -1,0 +1,355 @@
+From 8d5e85f8a8be44dcc83cab9079845dda925e0168 Mon Sep 17 00:00:00 2001
+From: Weiye Chen <weiye.chen@rock-chips.com>
+Date: Sat, 12 Sep 2026 15:02:03 +0800
+Subject: [PATCH] gtkwaylandsink: support Rockchip AFBC DMA-BUF
+
+Advertise only the supported Rockchip AFBC modifier for YU08 and YU10.
+Always expose legacy linear NV12_10LE40 DMA-BUF caps when the Wayland
+display supports NV15 with a linear modifier. This keeps 10-bit decoder
+output on the zero-copy path when AFBC is disabled.
+
+When GST_MPP_VIDEODEC_DEFAULT_ARM_AFBC is present, accept the legacy
+arm-afbc caps representation and import AFBC buffers directly through
+Wayland DMA-BUF. Gating only the legacy AFBC caps prevents conversion
+elements from selecting AFBC for linear decoder output.
+
+Apply GstVideoCropMeta to the Wayland viewport so aligned decoder padding
+is not exposed as a green edge.
+
+Emit a stable error marker instead of copying compressed payloads when
+import fails, so Totem can rebuild with linear buffers.
+
+Signed-off-by: Weiye Chen <weiye.chen@rock-chips.com>
+---
+ ext/gtk/gstgtkwaylandsink.c | 253 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 247 insertions(+), 6 deletions(-)
+
+diff --git a/ext/gtk/gstgtkwaylandsink.c b/ext/gtk/gstgtkwaylandsink.c
+index 6ffc56b..d968fd5 100644
+--- a/ext/gtk/gstgtkwaylandsink.c
++++ b/ext/gtk/gstgtkwaylandsink.c
+@@ -22,2 +22,4 @@
+
++#include <drm_fourcc.h>
++
+ #ifdef HAVE_CONFIG_H
+@@ -30,3 +32,2 @@
+
+-#include <drm_fourcc.h>
+ #include <gdk/gdk.h>
+@@ -35,2 +36,75 @@
+
++#ifndef DRM_FORMAT_NV15
++#define DRM_FORMAT_NV15 fourcc_code ('N', 'V', '1', '5')
++#endif
++#ifndef DRM_FORMAT_YUV420_8BIT
++#define DRM_FORMAT_YUV420_8BIT fourcc_code ('Y', 'U', '0', '8')
++#endif
++#ifndef DRM_FORMAT_YUV420_10BIT
++#define DRM_FORMAT_YUV420_10BIT fourcc_code ('Y', 'U', '1', '0')
++#endif
++#ifndef DRM_FORMAT_MOD_ARM_AFBC
++#define DRM_FORMAT_MOD_ARM_AFBC(__afbc_mode) fourcc_mod_code (ARM, __afbc_mode)
++#endif
++#ifndef AFBC_FORMAT_MOD_BLOCK_SIZE_16x16
++#define AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 1ULL
++#endif
++#ifndef AFBC_FORMAT_MOD_SPARSE
++#define AFBC_FORMAT_MOD_SPARSE (1ULL << 6)
++#endif
++
++#define RK_AFBC_MODIFIER \
++  (DRM_FORMAT_MOD_ARM_AFBC (AFBC_FORMAT_MOD_SPARSE) | \
++   DRM_FORMAT_MOD_ARM_AFBC (AFBC_FORMAT_MOD_BLOCK_SIZE_16x16))
++
++static void
++gst_gtk_wayland_sink_fill_dmabuf_format_list (GstWlDisplay * display,
++    GValue * format_list)
++{
++  GValue display_formats = G_VALUE_INIT;
++  guint i;
++
++  g_value_init (&display_formats, GST_TYPE_LIST);
++  gst_wl_display_fill_dmabuf_format_list (display, &display_formats);
++
++  for (i = 0; i < gst_value_list_get_size (&display_formats); i++) {
++    const GValue *value = gst_value_list_get_value (&display_formats, i);
++    guint64 modifier = DRM_FORMAT_MOD_INVALID;
++    guint fourcc = 0;
++
++    if (G_VALUE_HOLDS_STRING (value))
++      fourcc = gst_video_dma_drm_fourcc_from_string (
++          g_value_get_string (value), &modifier);
++
++    if ((fourcc != DRM_FORMAT_YUV420_8BIT &&
++            fourcc != DRM_FORMAT_YUV420_10BIT) ||
++        modifier == RK_AFBC_MODIFIER)
++      gst_value_list_append_value (format_list, value);
++  }
++
++  g_value_unset (&display_formats);
++}
++
++static gboolean
++gst_gtk_wayland_sink_dmabuf_format_supported (const GValue * format_list,
++    guint target_fourcc, guint64 target_modifier)
++{
++  guint i;
++
++  for (i = 0; i < gst_value_list_get_size (format_list); i++) {
++    const GValue *value = gst_value_list_get_value (format_list, i);
++    guint64 modifier = DRM_FORMAT_MOD_INVALID;
++    guint fourcc = 0;
++
++    if (G_VALUE_HOLDS_STRING (value))
++      fourcc = gst_video_dma_drm_fourcc_from_string (
++          g_value_get_string (value), &modifier);
++
++    if (fourcc == target_fourcc && modifier == target_modifier)
++      return TRUE;
++  }
++
++  return FALSE;
++}
++
+ #ifdef GDK_WINDOWING_WAYLAND
+@@ -117,2 +191,4 @@ typedef struct _GstGtkWaylandSinkPrivate
+   gboolean skip_dumb_buffer_copy;
++  gboolean arm_afbc;
++  gboolean linear_nv15;
+ } GstGtkWaylandSinkPrivate;
+@@ -788,3 +864,4 @@ gst_gtk_wayland_sink_get_caps (GstBaseSink * bsink, GstCaps * filter)
+     /* Add corresponding dmabuf formats */
+-    gst_wl_display_fill_dmabuf_format_list (priv->display, &format_list);
++    gst_gtk_wayland_sink_fill_dmabuf_format_list (priv->display,
++        &format_list);
+     gst_structure_take_value (gst_caps_get_structure (caps, 0), "drm-format",
+@@ -792,2 +869,44 @@ gst_gtk_wayland_sink_get_caps (GstBaseSink * bsink, GstCaps * filter)
+
++    {
++      const GValue *dmabuf_formats =
++          gst_structure_get_value (gst_caps_get_structure (caps, 0),
++          "drm-format");
++
++      if (gst_gtk_wayland_sink_dmabuf_format_supported (dmabuf_formats,
++              DRM_FORMAT_NV15, DRM_FORMAT_MOD_LINEAR)) {
++        GstCaps *linear_caps = gst_caps_new_simple ("video/x-raw",
++            "format", G_TYPE_STRING, "NV12_10LE40", NULL);
++
++        if (g_strcmp0 (g_getenv ("WAYLANDSINK_FORCE_DMABUF"), "1") != 0)
++          gst_caps_set_features_simple (linear_caps,
++              gst_caps_features_new_single (GST_CAPS_FEATURE_MEMORY_DMABUF));
++        gst_caps_append (caps, linear_caps);
++      }
++    }
++
++    if (g_getenv ("GST_MPP_VIDEODEC_DEFAULT_ARM_AFBC") != NULL) {
++      const GValue *dmabuf_formats =
++          gst_structure_get_value (gst_caps_get_structure (caps, 0),
++          "drm-format");
++      GstCaps *legacy_caps = gst_caps_new_empty ();
++
++      if (gst_gtk_wayland_sink_dmabuf_format_supported (dmabuf_formats,
++              DRM_FORMAT_YUV420_8BIT, RK_AFBC_MODIFIER)) {
++        GstCaps *tmp_caps = gst_caps_new_simple ("video/x-raw",
++            "format", G_TYPE_STRING, "NV12",
++            "arm-afbc", G_TYPE_INT, 1, NULL);
++        gst_caps_append (legacy_caps, tmp_caps);
++      }
++
++      if (gst_gtk_wayland_sink_dmabuf_format_supported (dmabuf_formats,
++              DRM_FORMAT_YUV420_10BIT, RK_AFBC_MODIFIER)) {
++        GstCaps *tmp_caps = gst_caps_new_simple ("video/x-raw",
++            "format", G_TYPE_STRING, "NV12_10LE40",
++            "arm-afbc", G_TYPE_INT, 1, NULL);
++        gst_caps_append (legacy_caps, tmp_caps);
++      }
++
++      gst_caps_append (caps, legacy_caps);
++    }
++
+     g_value_init (&format_list, GST_TYPE_LIST);
+@@ -912,4 +1031,8 @@ gst_gtk_wayland_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
+   gboolean use_dmabuf;
++  GstStructure *structure;
++  gint arm_afbc = 0;
+
+   GST_DEBUG_OBJECT (self, "set caps %" GST_PTR_FORMAT, caps);
++  priv->arm_afbc = FALSE;
++  priv->linear_nv15 = FALSE;
+
+@@ -919,2 +1042,9 @@ gst_gtk_wayland_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
+
++    if (priv->drm_info.drm_fourcc == DRM_FORMAT_YUV420_8BIT ||
++        priv->drm_info.drm_fourcc == DRM_FORMAT_YUV420_10BIT) {
++      if (priv->drm_info.drm_modifier != RK_AFBC_MODIFIER)
++        goto unsupported_afbc_modifier;
++      priv->arm_afbc = TRUE;
++    }
++
+     if (!gst_video_info_dma_drm_to_video_info (&priv->drm_info,
+@@ -923,2 +1053,4 @@ gst_gtk_wayland_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
+   } else {
++    const GstCapsFeatures *features = gst_caps_get_features (caps, 0);
++
+     /* extract info from caps */
+@@ -930,2 +1062,31 @@ gst_gtk_wayland_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
+       gst_video_info_dma_drm_init (&priv->drm_info);
++
++    if ((gst_caps_features_contains (features,
++                GST_CAPS_FEATURE_MEMORY_DMABUF) ||
++            g_strcmp0 (g_getenv ("WAYLANDSINK_FORCE_DMABUF"), "1") == 0) &&
++        GST_VIDEO_INFO_FORMAT (&priv->video_info) ==
++            GST_VIDEO_FORMAT_NV12_10LE40) {
++      priv->drm_info.drm_fourcc = DRM_FORMAT_NV15;
++      priv->drm_info.drm_modifier = DRM_FORMAT_MOD_LINEAR;
++      priv->linear_nv15 = TRUE;
++    }
++
++    structure = gst_caps_get_structure (caps, 0);
++    if (g_getenv ("GST_MPP_VIDEODEC_DEFAULT_ARM_AFBC") != NULL &&
++        gst_structure_get_int (structure, "arm-afbc", &arm_afbc) &&
++        arm_afbc == 1) {
++      switch (GST_VIDEO_INFO_FORMAT (&priv->video_info)) {
++        case GST_VIDEO_FORMAT_NV12:
++          priv->drm_info.drm_fourcc = DRM_FORMAT_YUV420_8BIT;
++          break;
++        case GST_VIDEO_FORMAT_NV12_10LE40:
++          priv->drm_info.drm_fourcc = DRM_FORMAT_YUV420_10BIT;
++          break;
++        default:
++          goto unsupported_afbc_format;
++      }
++
++      priv->drm_info.drm_modifier = RK_AFBC_MODIFIER;
++      priv->arm_afbc = TRUE;
++    }
+   }
+@@ -941,4 +1102,5 @@ gst_gtk_wayland_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
+
+-  use_dmabuf = gst_caps_features_contains (gst_caps_get_features (caps, 0),
+-      GST_CAPS_FEATURE_MEMORY_DMABUF);
++  use_dmabuf = priv->arm_afbc || priv->linear_nv15 ||
++      gst_caps_features_contains (gst_caps_get_features (caps, 0),
++          GST_CAPS_FEATURE_MEMORY_DMABUF);
+
+@@ -986,2 +1148,9 @@ invalid_format:
+   {
++    if (priv->arm_afbc) {
++      GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
++          ("Could not normalize Rockchip AFBC caps"),
++          ("totem-afbc-fallback: caps=%" GST_PTR_FORMAT, caps));
++      return FALSE;
++    }
++
+     GST_ERROR_OBJECT (self,
+@@ -990,4 +1159,24 @@ invalid_format:
+   }
++unsupported_afbc_modifier:
++  {
++    GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
++        ("Unsupported Rockchip AFBC modifier"),
++        ("totem-afbc-fallback: fourcc=%" GST_FOURCC_FORMAT
++            " modifier=0x%016" G_GINT64_MODIFIER "x",
++            GST_FOURCC_ARGS (priv->drm_info.drm_fourcc),
++            priv->drm_info.drm_modifier));
++    return FALSE;
++  }
+ unsupported_drm_format:
+   {
++    if (priv->arm_afbc) {
++      GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
++          ("AFBC format is not available on the Wayland display"),
++          ("totem-afbc-fallback: fourcc=%" GST_FOURCC_FORMAT
++              " modifier=0x%016" G_GINT64_MODIFIER "x",
++              GST_FOURCC_ARGS (priv->drm_info.drm_fourcc),
++              priv->drm_info.drm_modifier));
++      return FALSE;
++    }
++
+     GST_ERROR_OBJECT (self, "DRM format %" GST_FOURCC_FORMAT
+@@ -1003,2 +1192,9 @@ unsupported_format:
+   }
++unsupported_afbc_format:
++  {
++    GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
++        ("Unsupported Rockchip AFBC video format"),
++        ("totem-afbc-fallback: caps=%" GST_PTR_FORMAT, caps));
++    return FALSE;
++  }
+ }
+@@ -1014,2 +1210,3 @@ gst_gtk_wayland_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
+   gboolean need_pool;
++  gboolean use_dmabuf;
+
+@@ -1017,3 +1214,20 @@ gst_gtk_wayland_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
+
+-  if (need_pool && !gst_video_is_dma_drm_caps (caps)) {
++  use_dmabuf = priv->linear_nv15 || (caps && (gst_video_is_dma_drm_caps (caps) ||
++      gst_caps_features_contains (gst_caps_get_features (caps, 0),
++          GST_CAPS_FEATURE_MEMORY_DMABUF)));
++
++  if (caps) {
++    GstStructure *structure = gst_caps_get_structure (caps, 0);
++    gint arm_afbc = 0;
++
++    if (g_getenv ("GST_MPP_VIDEODEC_DEFAULT_ARM_AFBC") != NULL &&
++        gst_structure_get_int (structure, "arm-afbc", &arm_afbc) &&
++        arm_afbc == 1) {
++      gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
++      gst_query_add_allocation_meta (query, GST_VIDEO_CROP_META_API_TYPE, NULL);
++      return TRUE;
++    }
++  }
++
++  if (need_pool && !use_dmabuf) {
+     GstStructure *config;
+@@ -1032,3 +1246,3 @@ gst_gtk_wayland_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
+
+-  if (!gst_video_is_dma_drm_caps (caps)) {
++  if (!use_dmabuf) {
+     GstAllocator *alloc = gst_shm_allocator_get ();
+@@ -1039,2 +1253,4 @@ gst_gtk_wayland_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
+   gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
++  if (use_dmabuf)
++    gst_query_add_allocation_meta (query, GST_VIDEO_CROP_META_API_TYPE, NULL);
+
+@@ -1073,2 +1289,3 @@ gst_gtk_wayland_sink_show_frame (GstVideoSink * vsink, GstBuffer * buffer)
+   GstMemory *mem;
++  GstVideoCropMeta *crop;
+   struct wl_buffer *wbuf = NULL;
+@@ -1092,2 +1309,10 @@ gst_gtk_wayland_sink_show_frame (GstVideoSink * vsink, GstBuffer * buffer)
+
++  crop = gst_buffer_get_video_crop_meta (buffer);
++  if (crop) {
++    GST_LOG_OBJECT (self, "applying crop x=%u y=%u width=%u height=%u",
++        crop->x, crop->y, crop->width, crop->height);
++    gst_wl_window_ensure_crop (priv->wl_window, crop->x, crop->y,
++        crop->width, crop->height);
++  }
++
+   wlbuffer = gst_buffer_get_wl_buffer (priv->display, buffer);
+@@ -1122,2 +1347,5 @@ gst_gtk_wayland_sink_show_frame (GstVideoSink * vsink, GstBuffer * buffer)
+
++    if (!wbuf && priv->arm_afbc)
++      goto no_afbc_buffer;
++
+     if (!wbuf && !priv->skip_dumb_buffer_copy) {
+@@ -1285,2 +1513,15 @@ no_wl_buffer:
+   }
++no_afbc_buffer:
++  {
++    GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
++        ("Could not directly import Rockchip AFBC DMA-BUF"),
++        ("totem-afbc-fallback: fourcc=%" GST_FOURCC_FORMAT
++            " modifier=0x%016" G_GINT64_MODIFIER "x memories=%u size=%"
++            G_GSIZE_FORMAT,
++            GST_FOURCC_ARGS (priv->drm_info.drm_fourcc),
++            priv->drm_info.drm_modifier, gst_buffer_n_memory (buffer),
++            gst_buffer_get_size (buffer)));
++    ret = GST_FLOW_ERROR;
++    goto done;
++  }
+ activate_failed:
+--
+2.34.1

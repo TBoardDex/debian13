@@ -1,0 +1,10 @@
+# 编译输出/过程产物
+binary/
+rockchip-rootfs.img
+*.tar.gz
+*.iso
+chroot*/
+*.log
+
+# 分卷合并后的deb（仓库内只存.part-分卷，运行时自动合并）
+packages/*/chromium/*.deb

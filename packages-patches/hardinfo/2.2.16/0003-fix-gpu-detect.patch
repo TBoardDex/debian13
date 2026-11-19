@@ -1,0 +1,39 @@
+From f1002fa3520d4ea3222177f9314f139e2eca08d7 Mon Sep 17 00:00:00 2001
+From: Caesar Wang <wxt@rock-chips.com>
+Date: Wed, 15 Jul 2026 16:34:10 +0800
+Subject: [PATCH 3/3] fix gpu detect
+
+Signed-off-by: Caesar Wang <wxt@rock-chips.com>
+---
+ hardinfo2/gpu_util.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/hardinfo2/gpu_util.c b/hardinfo2/gpu_util.c
+index b567f48..219acb6 100644
+--- a/hardinfo2/gpu_util.c
++++ b/hardinfo2/gpu_util.c
+@@ -274,8 +274,19 @@ static gchar *dt_find_gpu(dtr *dt, char *np) {
+         if ( strchr(ntmp+1, '/') == NULL) {
+             ftmp = ntmp + 4;
+             /* should either be NULL or @ */
+-            if (*ftmp == '\0' || *ftmp == '@')
+-                return g_strdup(dt_path);
++            if (*ftmp == '\0' || *ftmp == '@') {
++                /* Verify this is a real GPU device node, not a
++                 * pinctrl subnode (e.g. /pinctrl/gpu on Rockchip).
++                 * Real GPU nodes have a "compatible" property. */
++                gchar *compat_test = g_strdup_printf("%s/compatible", dt_path);
++                gchar *compat_val = dtr_get_string(compat_test, 0);
++                g_free(compat_test);
++                if (compat_val && strlen(compat_val) > 0) {
++                    g_free(compat_val);
++                    return g_strdup(dt_path);
++                }
++                g_free(compat_val);
++            }
+         }
+     }
+ 
+-- 
+2.34.1
+

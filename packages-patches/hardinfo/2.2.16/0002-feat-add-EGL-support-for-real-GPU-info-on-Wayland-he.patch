@@ -1,0 +1,113 @@
+From 120e2f5b607628f0502bf8dfa8408c140d9add5d Mon Sep 17 00:00:00 2001
+From: Caesar Wang <wxt@rock-chips.com>
+Date: Wed, 15 Jul 2026 16:17:55 +0800
+Subject: [PATCH 2/3] feat: add EGL support for real GPU info on
+ Wayland/headless systems
+
+- Try eglinfo first to get real GPU info on Wayland/headless systems
+- Mali and other ARM GPUs only provide EGL, not GLX
+- Use EGL data only if a real GPU is present (not llvmpipe)
+- Fix label conflict by renaming glx_next_line to glx_next_line2
+- Fallback to glxinfo if eglinfo fails or shows software renderer
+
+Signed-off-by: Caesar Wang <wxt@rock-chips.com>
+---
+ hardinfo2/x_util.c | 69 ++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/hardinfo2/x_util.c b/hardinfo2/x_util.c
+index c9a5b0b..96d05e1 100644
+--- a/hardinfo2/x_util.c
++++ b/hardinfo2/x_util.c
+@@ -149,11 +149,74 @@ void vk_free(vk_info *s) {
+ gboolean fill_glx_info(glx_info *glx) {
+     gboolean spawned;
+     gchar *out, *err, *p, *l, *next_nl;
+-    gchar *glx_cmd = g_strdup("glxinfo");
+ 
+ #define GLX_MATCH_LINE(prefix_str, struct_member) \
+     if (l = simple_line_value(p, prefix_str)) { glx->struct_member = g_strdup(l); goto glx_next_line; }
+ 
++    /* Try eglinfo first to get real GPU info on Wayland/headless systems.
++     * Mali and other ARM GPUs only provide EGL, not GLX. glxinfo falls back
++     * to Mesa's llvmpipe software renderer, which is misleading.
++     * If eglinfo reports a real (non-software) renderer, use it. */
++    gchar *egl_cmd = g_strdup("eglinfo");
++    spawned = hardinfo_spawn_command_line_sync(egl_cmd, &out, &err, NULL, NULL);
++    g_free(egl_cmd);
++    if (spawned) {
++        gchar *egl_renderer = NULL;
++        gchar *egl_vendor = NULL;
++        p = out;
++        while(next_nl = strchr(p, '\n')) {
++            strend(p, '\n');
++            g_strstrip(p);
++            if (!egl_renderer) {
++                l = simple_line_value(p, "OpenGL ES profile renderer:");
++                if (l) egl_renderer = g_strdup(l);
++            }
++            if (!egl_vendor) {
++                l = simple_line_value(p, "OpenGL ES profile vendor:");
++                if (l) egl_vendor = g_strdup(l);
++            }
++            p = next_nl + 1;
++        }
++        /* Use EGL data only if a real GPU is present (not llvmpipe) */
++        if (egl_renderer && !strstr(egl_renderer, "llvmpipe")) {
++            p = out;
++            while(next_nl = strchr(p, '\n')) {
++                strend(p, '\n');
++                g_strstrip(p);
++                GLX_MATCH_LINE("OpenGL ES profile version string", ogles_version);
++                GLX_MATCH_LINE("OpenGL ES profile shading language version string", ogles_sl_version);
++                if (l = simple_line_value(p, "OpenGL ES profile version:")) {
++                    glx->ogl_version = g_strdup(l);
++                    glx->ogl_core_version = g_strdup(l);
++                    goto glx_next_line;
++                }
++                if (l = simple_line_value(p, "OpenGL ES profile shading language version:")) {
++                    glx->ogl_sl_version = g_strdup(l);
++                    glx->ogl_core_sl_version = g_strdup(l);
++                    goto glx_next_line;
++                }
++                if (l = simple_line_value(p, "EGL version string:")) {
++                    glx->glx_version = g_strdup(l);
++                    goto glx_next_line;
++                }
++                glx_next_line:
++                    p = next_nl + 1;
++            }
++            glx->ogl_vendor = egl_vendor;
++            glx->ogl_renderer = egl_renderer;
++            glx->direct_rendering = 1;
++            g_free(out);
++            g_free(err);
++            return TRUE;
++        }
++        g_free(egl_renderer);
++        g_free(egl_vendor);
++        g_free(out);
++        g_free(err);
++    }
++
++    /* Fallback: original glxinfo path */
++    gchar *glx_cmd = g_strdup("glxinfo");
+     spawned = hardinfo_spawn_command_line_sync(glx_cmd, &out, &err, NULL, NULL);
+     g_free(glx_cmd);
+     if (spawned) {
+@@ -174,10 +237,10 @@ gboolean fill_glx_info(glx_info *glx) {
+             if (l = simple_line_value(p, "direct rendering")) {
+                 if (strstr(p, "Yes"))
+                     glx->direct_rendering = 1;
+-                goto glx_next_line;
++                goto glx_next_line2;
+             }
+ 
+-            glx_next_line:
++            glx_next_line2:
+                 p = next_nl + 1;
+         }
+         g_free(out);
+-- 
+2.34.1
+

@@ -1,0 +1,446 @@
+From e07d44594a58766e73b9acd0b7785317545ad2ac Mon Sep 17 00:00:00 2001
+From: Weiye Chen <weiye.chen@rock-chips.com>
+Date: Sat, 12 Sep 2026 15:17:32 +0800
+Subject: [PATCH 1/2] backend: use gtkwaylandsink with synchronized transitions
+
+Prefer gtkwaylandsink on native Wayland and use playbin3 with a
+playbin fallback.
+
+Keep the GTK top-level transparent and draw the preroll black background
+inside BaconVideoWidget so GTK clips it to the current video allocation.
+When returning to the browser, commit a top-level black overlay before
+stopping the pipeline. Keep it until the browser page has painted so the
+desktop is not exposed between parent and video subsurface updates.
+---
+ data/totem.ui                         |  14 ++
+ src/backend/bacon-video-widget.c      |  75 +++++++--
+ src/backend/bacon-video-widget.h      |   1 +
+ src/plugins/rotation/totem-rotation.c |   2 +-
+ src/totem-object.c                    | 214 +++++++++++++++++++++++++-
+ src/totem-private.h                   |  13 ++
+ 6 files changed, 304 insertions(+), 15 deletions(-)
+
+diff --git a/data/totem.ui b/data/totem.ui
+index 7cb93ed..b106366 100644
+--- a/data/totem.ui
++++ b/data/totem.ui
+@@ -187,2 +187,5 @@
+     <child>
++      <object class="GtkOverlay" id="totem_main_overlay">
++        <property name="visible">True</property>
++        <child>
+       <object class="GtkStack" id="tmw_main_stack">
+@@ -424,2 +427,13 @@ audio-volume-medium-symbolic</property>
+       </object>
++        </child>
++        <child type="overlay">
++          <object class="GtkEventBox" id="wayland_transition_cover">
++            <property name="visible">False</property>
++            <property name="no_show_all">True</property>
++            <property name="hexpand">True</property>
++            <property name="vexpand">True</property>
++            <property name="can_focus">False</property>
++          </object>
++        </child>
++      </object>
+     </child>
+diff --git a/src/backend/bacon-video-widget.c b/src/backend/bacon-video-widget.c
+index 4250d59..5c05c2c 100644
+--- a/src/backend/bacon-video-widget.c
++++ b/src/backend/bacon-video-widget.c
+@@ -77,2 +77,3 @@
+ #include <gtk/gtk.h>
++#include <gdk/gdkwayland.h>
+ #include <glib/gi18n-lib.h>
+@@ -128,2 +129,4 @@ enum
+   SIGNAL_LANGUAGES_CHANGED,
++  SIGNAL_VIDEO_TRANSITION_START,
++  SIGNAL_VIDEO_FRAME_READY,
+   LAST_SIGNAL
+@@ -198,2 +201,3 @@ struct _BaconVideoWidget
+   gboolean                     use_gl;
++  gboolean                     use_gtkwaylandsink;
+
+@@ -1013,2 +1017,14 @@ bacon_video_widget_class_init (BaconVideoWidgetClass * klass)
+
++  bvw_signals[SIGNAL_VIDEO_TRANSITION_START] =
++    g_signal_new ("video-transition-start",
++                  G_TYPE_FROM_CLASS (object_class), G_SIGNAL_RUN_LAST,
++                  0, NULL, NULL, g_cclosure_marshal_VOID__VOID,
++                  G_TYPE_NONE, 0);
++
++  bvw_signals[SIGNAL_VIDEO_FRAME_READY] =
++    g_signal_new ("video-frame-ready",
++                  G_TYPE_FROM_CLASS (object_class), G_SIGNAL_RUN_LAST,
++                  0, NULL, NULL, g_cclosure_marshal_VOID__VOID,
++                  G_TYPE_NONE, 0);
++
+   g_resources_register (_bvw_get_resource ());
+@@ -1949,2 +1965,4 @@ bvw_bus_message_cb (GstBus * bus, GstMessage * message, BaconVideoWidget *bvw)
+         bvw_update_stream_info (bvw);
++        if (bvw->use_gtkwaylandsink && bvw->media_has_video)
++          g_signal_emit (bvw, bvw_signals[SIGNAL_VIDEO_FRAME_READY], 0);
+         if (!bvw_check_missing_plugins_on_preroll (bvw)) {
+@@ -3566,3 +3584,6 @@ bacon_video_widget_open (BaconVideoWidget *bvw,
+   g_return_if_fail (bvw->play != NULL);
+-  
++
++  if (bvw->use_gtkwaylandsink)
++    g_signal_emit (bvw, bvw_signals[SIGNAL_VIDEO_TRANSITION_START], 0);
++
+   /* So we aren't closed yet... */
+@@ -3859,2 +3880,5 @@ bvw_stop_play_pipeline (BaconVideoWidget * bvw)
+
++  if (bvw->use_gtkwaylandsink)
++    g_signal_emit (bvw, bvw_signals[SIGNAL_VIDEO_TRANSITION_START], 0);
++
+   gst_element_get_state (bvw->play, &cur_state, NULL, 0);
+@@ -3892,3 +3916,3 @@ bvw_stop_play_pipeline (BaconVideoWidget * bvw)
+
+-  if (bvw->use_gl)
++  if (bvw->use_gl || bvw->use_gtkwaylandsink)
+     g_object_set (bvw->video_sink,
+@@ -4505,3 +4529,3 @@ bacon_video_widget_set_rotation (BaconVideoWidget *bvw,
+
+-  if (!bvw->use_gl)
++  if (!bvw->use_gl && !bvw->use_gtkwaylandsink)
+     return;
+@@ -4549,2 +4573,18 @@ bacon_video_widget_use_gl (BaconVideoWidget *bvw)
+
++/**
++ * bacon_video_widget_can_rotate:
++ * @bvw: a #BaconVideoWidget
++ *
++ * Returns whether the selected video sink supports rotation.
++ *
++ * Return value: %TRUE if rotation is supported, %FALSE otherwise
++ **/
++gboolean
++bacon_video_widget_can_rotate (BaconVideoWidget *bvw)
++{
++  g_return_val_if_fail (BACON_IS_VIDEO_WIDGET (bvw), FALSE);
++
++  return bvw->use_gl || bvw->use_gtkwaylandsink;
++}
++
+ /* Search for the color balance channel corresponding to type and return it. */
+@@ -5622,13 +5662,26 @@ bvw_init_video_sink (BaconVideoWidget *bvw)
+
+-  bvw->use_gl = bvw_gl_check (GTK_WIDGET (bvw));
++  bvw->use_gtkwaylandsink =
++    !is_feature_enabled ("TOTEM_USE_GST_GTKSINK") &&
++    GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (bvw)));
++  if (bvw->use_gtkwaylandsink) {
++    bvw->video_sink = gst_element_factory_make ("gtkwaylandsink", "video-sink");
++    bvw->use_gtkwaylandsink = bvw->video_sink != NULL;
++  }
++  bvw->use_gl = !bvw->use_gtkwaylandsink && bvw_gl_check (GTK_WIDGET (bvw));
+
+   /* Instantiate all the fallible plugins */
+-  bvw->play = element_make_or_warn ("playbin", "play");
++  bvw->play = element_make_or_warn ("playbin3", "play");
++  if (bvw->play == NULL) {
++    GST_WARNING ("Falling back to playbin because playbin3 is unavailable");
++    bvw->play = element_make_or_warn ("playbin", "play");
++  }
+   bvw->audio_pitchcontrol = element_make_or_warn ("scaletempo", "scaletempo");
+
+-  if (bvw->use_gl) {
+-    bvw->video_sink = element_make_or_warn ("gtkglsink", "video-sink");
+-    glsinkbin = element_make_or_warn ("glsinkbin", "glsinkbin");
+-  } else {
+-    bvw->video_sink = element_make_or_warn ("gtksink", "video-sink");
++  if (!bvw->use_gtkwaylandsink) {
++    if (bvw->use_gl) {
++      bvw->video_sink = element_make_or_warn ("gtkglsink", "video-sink");
++      glsinkbin = element_make_or_warn ("glsinkbin", "glsinkbin");
++    } else {
++      bvw->video_sink = element_make_or_warn ("gtksink", "video-sink");
++    }
+   }
+@@ -5706,3 +5759,3 @@ bvw_init_video_sink (BaconVideoWidget *bvw)
+
+-  if (bvw->use_gl)
++  if (bvw->use_gl || bvw->use_gtkwaylandsink)
+     g_object_set (bvw->video_sink,
+diff --git a/src/backend/bacon-video-widget.h b/src/backend/bacon-video-widget.h
+index 080462b..19abfca 100644
+--- a/src/backend/bacon-video-widget.h
++++ b/src/backend/bacon-video-widget.h
+@@ -285,2 +285,3 @@ BvwRotation bacon_video_widget_get_rotation	 (BaconVideoWidget *bvw);
+ gboolean bacon_video_widget_use_gl	         (BaconVideoWidget *bvw);
++gboolean bacon_video_widget_can_rotate	         (BaconVideoWidget *bvw);
+
+diff --git a/src/plugins/rotation/totem-rotation.c b/src/plugins/rotation/totem-rotation.c
+index b95798d..55911a8 100644
+--- a/src/plugins/rotation/totem-rotation.c
++++ b/src/plugins/rotation/totem-rotation.c
+@@ -223,3 +223,3 @@ impl_activate (PeasActivatable *plugin)
+ 	/* rotate-method is not supported by gtksink */
+-	if (!bacon_video_widget_use_gl (BACON_VIDEO_WIDGET (pi->bvw)))
++	if (!bacon_video_widget_can_rotate (BACON_VIDEO_WIDGET (pi->bvw)))
+ 		return;
+diff --git a/src/totem-object.c b/src/totem-object.c
+index 0115a32..b13cdd9 100644
+--- a/src/totem-object.c
++++ b/src/totem-object.c
+@@ -41,2 +41,3 @@
+ #include <gtk/gtk.h>
++#include <gdk/gdkwayland.h>
+ #include <glib/gi18n.h>
+@@ -108,2 +109,185 @@ static void totem_setup_window (TotemObject *totem);
+
++static gboolean
++clear_wayland_window_background_cb (GtkWidget *widget,
++				    cairo_t   *cr,
++				    gpointer   user_data)
++{
++	(void) widget;
++	(void) user_data;
++
++	cairo_save (cr);
++	cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
++	cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, 0.0);
++	cairo_paint (cr);
++	cairo_restore (cr);
++
++	return GDK_EVENT_PROPAGATE;
++}
++
++static gboolean
++draw_wayland_video_background_cb (GtkWidget *widget,
++				  cairo_t   *cr,
++				  gpointer   user_data)
++{
++	TotemObject *totem = user_data;
++
++	(void) widget;
++	if (totem == NULL || totem->wayland_video_ready)
++		return GDK_EVENT_PROPAGATE;
++
++	cairo_save (cr);
++	cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
++	cairo_set_source_rgb (cr, 0.0, 0.0, 0.0);
++	cairo_paint (cr);
++	cairo_restore (cr);
++
++	return GDK_EVENT_PROPAGATE;
++}
++
++static gboolean
++wayland_video_ready_tick_cb (GtkWidget *widget,
++				     GdkFrameClock *clock,
++				     gpointer user_data)
++{
++	TotemObject *totem = user_data;
++
++	(void) clock;
++	if (totem->wayland_video_tick_id != 0)
++		totem->wayland_video_tick_id = 0;
++	totem->wayland_video_ready = TRUE;
++	gtk_widget_queue_draw (widget);
++	return G_SOURCE_REMOVE;
++}
++
++static void
++wayland_video_transition_start_cb (BaconVideoWidget *bvw,
++					   TotemObject *totem)
++{
++	(void) bvw;
++	if (totem->wayland_video_tick_id != 0) {
++		gtk_widget_remove_tick_callback (totem->win,
++						 totem->wayland_video_tick_id);
++		totem->wayland_video_tick_id = 0;
++	}
++	totem->wayland_video_ready = FALSE;
++	gtk_widget_queue_draw (totem->win);
++}
++
++static void
++wayland_video_frame_ready_cb (BaconVideoWidget *bvw,
++				      TotemObject *totem)
++{
++	(void) bvw;
++	if (totem->wayland_video_tick_id == 0 && !totem->wayland_video_ready)
++		totem->wayland_video_tick_id = gtk_widget_add_tick_callback
++			(totem->win, wayland_video_ready_tick_cb, totem, NULL);
++}
++
++static gboolean
++setup_wayland_video_window (TotemObject *totem)
++{
++	GdkDisplay *display;
++	GdkVisual *visual;
++	GstElementFactory *factory;
++
++	display = gtk_widget_get_display (totem->win);
++	if (!GDK_IS_WAYLAND_DISPLAY (display) ||
++	    g_strcmp0 (g_getenv ("TOTEM_USE_GST_GTKSINK"), "1") == 0)
++		return FALSE;
++
++	factory = gst_element_factory_find ("gtkwaylandsink");
++	if (factory == NULL)
++		return FALSE;
++	gst_object_unref (factory);
++
++	visual = gdk_screen_get_rgba_visual (gtk_widget_get_screen (totem->win));
++	if (visual == NULL)
++		return FALSE;
++
++	gtk_widget_set_visual (totem->win, visual);
++	gtk_widget_set_app_paintable (totem->win, TRUE);
++	g_signal_connect (totem->win, "draw",
++			  G_CALLBACK (clear_wayland_window_background_cb), totem);
++	g_signal_connect (totem->bvw, "draw",
++			  G_CALLBACK (draw_wayland_video_background_cb), totem);
++	return TRUE;
++}
++
++static void wayland_transition_cancel (TotemObject *totem);
++
++static gboolean
++wayland_transition_cover_draw_cb (GtkWidget *widget, cairo_t *cr, gpointer data)
++{
++	TotemObject *totem = data;
++	(void) widget;
++	totem->wayland_transition_cover_drawn = TRUE;
++	cairo_set_source_rgb (cr, 0.0, 0.0, 0.0);
++	cairo_paint (cr);
++	return GDK_EVENT_STOP;
++}
++
++static void
++wayland_transition_after_paint_cb (GdkFrameClock *clock, TotemObject *totem)
++{
++	if (clock != totem->wayland_transition_clock)
++		return;
++	if (totem->wayland_transition_state == WAYLAND_TRANSITION_WAIT_TARGET) {
++		totem->wayland_transition_state = WAYLAND_TRANSITION_IDLE;
++		g_signal_handler_disconnect (clock, totem->wayland_transition_handler);
++		totem->wayland_transition_handler = 0;
++		totem->wayland_transition_clock = NULL;
++		gtk_widget_hide (totem->wayland_transition_cover);
++		return;
++	}
++	if (totem->wayland_transition_state != WAYLAND_TRANSITION_WAIT_COVER ||
++	    !totem->wayland_transition_cover_drawn)
++		return;
++	totem->wayland_transition_state = WAYLAND_TRANSITION_WAIT_TARGET;
++	totem_playlist_clear (totem->playlist);
++	totem_object_set_main_page (totem, "grilo");
++	gtk_window_unfullscreen (GTK_WINDOW (totem->win));
++	bacon_video_widget_set_show_cursor (totem->bvw, TRUE);
++	gtk_widget_queue_draw (totem->stack);
++}
++
++static void
++wayland_transition_begin (TotemObject *totem)
++{
++	GdkFrameClock *clock;
++	if (totem->wayland_transition_cover == NULL ||
++	    totem->wayland_transition_state != WAYLAND_TRANSITION_IDLE)
++		return;
++	gtk_widget_show (totem->wayland_transition_cover);
++	totem->wayland_transition_cover_drawn = FALSE;
++	gtk_widget_queue_draw (totem->wayland_transition_cover);
++	clock = gtk_widget_get_frame_clock (totem->win);
++	if (clock == NULL) {
++		gtk_widget_hide (totem->wayland_transition_cover);
++		totem_playlist_clear (totem->playlist);
++		totem_object_set_main_page (totem, "grilo");
++		gtk_window_unfullscreen (GTK_WINDOW (totem->win));
++		bacon_video_widget_set_show_cursor (totem->bvw, TRUE);
++		return;
++	}
++	totem->wayland_transition_clock = clock;
++	totem->wayland_transition_state = WAYLAND_TRANSITION_WAIT_COVER;
++	totem->wayland_transition_handler = g_signal_connect
++		(clock, "after-paint", G_CALLBACK (wayland_transition_after_paint_cb), totem);
++}
++
++static void
++wayland_transition_cancel (TotemObject *totem)
++{
++	if (totem->wayland_transition_clock != NULL &&
++	    totem->wayland_transition_handler != 0)
++		g_signal_handler_disconnect (totem->wayland_transition_clock,
++					     totem->wayland_transition_handler);
++	totem->wayland_transition_clock = NULL;
++	totem->wayland_transition_handler = 0;
++	totem->wayland_transition_state = WAYLAND_TRANSITION_IDLE;
++	totem->wayland_transition_cover_drawn = FALSE;
++	if (totem->wayland_transition_cover != NULL)
++		gtk_widget_hide (totem->wayland_transition_cover);
++}
++
+ #define action_set_sensitive(name, state)					\
+@@ -226,2 +410,9 @@ totem_object_app_activate (GApplication *app)
+ 	totem->win = GTK_WIDGET (gtk_builder_get_object (totem->xml, "totem_main_window"));
++	if (setup_wayland_video_window (totem)) {
++		totem->wayland_transition_cover = GTK_WIDGET (gtk_builder_get_object
++			(totem->xml, "wayland_transition_cover"));
++	}
++	if (totem->wayland_transition_cover != NULL)
++		g_signal_connect_object (totem->wayland_transition_cover, "draw",
++					 G_CALLBACK (wayland_transition_cover_draw_cb), totem, 0);
+ #if DEVELOPMENT_VERSION
+@@ -1082,2 +1273,4 @@ totem_object_set_main_page (TotemObject *totem,
+ 		totem_grilo_start (TOTEM_GRILO (totem->grilo));
++		/* Keep the opaque backing while the list page is committed. */
++		wayland_video_transition_start_cb (NULL, totem);
+ 		g_object_set (totem->header,
+@@ -1370,2 +1563,4 @@ totem_object_exit (TotemObject *totem)
+ 	GdkDisplay *display = NULL;
++	if (totem != NULL)
++		wayland_transition_cancel (totem);
+
+@@ -2455,2 +2650,7 @@ back_button_clicked_cb (GtkButton   *button,
+ 	if (g_strcmp0 (totem_object_get_main_page (totem), "player") == 0) {
++		if (totem->wayland_transition_cover != NULL &&
++		    GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (totem->win))) {
++			wayland_transition_begin (totem);
++			return;
++		}
+ 		totem_playlist_clear (totem->playlist);
+@@ -4251,5 +4451,13 @@ video_widget_create (TotemObject *totem)
+ 	g_signal_connect (G_OBJECT (totem->bvw),
+-			  "play-starting",
+-			  G_CALLBACK (play_starting_cb),
+-			  totem);
++			"play-starting",
++			G_CALLBACK (play_starting_cb),
++			totem);
++	g_signal_connect (G_OBJECT (totem->bvw),
++			"video-transition-start",
++			G_CALLBACK (wayland_video_transition_start_cb),
++			totem);
++	g_signal_connect (G_OBJECT (totem->bvw),
++			"video-frame-ready",
++			G_CALLBACK (wayland_video_frame_ready_cb),
++			totem);
+ 	g_signal_connect (G_OBJECT (totem->bvw),
+diff --git a/src/totem-private.h b/src/totem-private.h
+index be78083..71b3c31 100644
+--- a/src/totem-private.h
++++ b/src/totem-private.h
+@@ -50,2 +50,8 @@ typedef enum {
+
++typedef enum {
++	WAYLAND_TRANSITION_IDLE,
++	WAYLAND_TRANSITION_WAIT_COVER,
++	WAYLAND_TRANSITION_WAIT_TARGET,
++} WaylandTransitionState;
++
+ struct _TotemObject {
+@@ -62,2 +68,9 @@ struct _TotemObject {
+ 	GtkWidget *spinner;
++	gboolean wayland_video_ready;
++	guint wayland_video_tick_id;
++	GtkWidget *wayland_transition_cover;
++	GdkFrameClock *wayland_transition_clock;
++	gulong wayland_transition_handler;
++	WaylandTransitionState wayland_transition_state;
++	gboolean wayland_transition_cover_drawn;
+
+--
+2.34.1
